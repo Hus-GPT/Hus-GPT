@@ -105,6 +105,9 @@ def load_urls_from_json(path):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
+    # Legacy markup may invoke the course endpoint with a bare numeric argument.
+    if key.lower() == "subjectid":
+        found.update(int(m.group(1)) for m in re.finditer(r"""(?i)get_Courses_P2\s*\(\s*(\d+)""", html or ""))
         return found
     def walk(obj):
         if isinstance(obj, dict):
@@ -364,6 +367,9 @@ def _level_pairs(html):
                 for part in part_matches:
                     pairs.add((int(grade), int(part)))
     for match in re.finditer(r"""(?is)(?:gradeid|grade_id)\s*['"]?\s*[:=]\s*['"]?(\d+).*?(?:partid|part_id)\s*['"]?\s*[:=]\s*['"]?(\d+)""", html or ""):
+        pairs.add((int(match.group(1)), int(match.group(2))))
+    # Some level controls encode the two IDs positionally in an inline JavaScript call.
+    for match in re.finditer(r"""(?i)get_Subjects_P2\s*\(\s*(\d+)\s*,\s*(\d+)""", html or ""):
         pairs.add((int(match.group(1)), int(match.group(2))))
     return pairs
 
