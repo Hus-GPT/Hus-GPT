@@ -15,6 +15,8 @@ import zipfile
 from collections import defaultdict, deque
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, unquote
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     import requests
@@ -52,7 +54,7 @@ RESOURCE_EXTS = {
     ".ppt", ".pptx", ".odt", ".ods", ".odp", ".txt", ".rtf",
     ".mp4", ".m4v", ".mov", ".avi", ".mp3", ".m4a", ".wav", ".webm"
 }
-ARCHIVE_EXTS = {".zip", ".rar", ".7z"}
+ARCHIVE_EXTS = {".zip", ".rar"}
 MAX_PAGES = int(os.getenv("EDUNET_MAX_PAGES", "180"))
 MAX_DOWNLOADS = int(os.getenv("EDUNET_MAX_DOWNLOADS", "500"))
 TIMEOUT = 35
@@ -130,15 +132,43 @@ def discover_existing(root):
     return urls
 
 def local_course_from_path(url, anchor_text=""):
+    """High-confidence match: course code or explicit numbered Arabic course label."""
     combined = (url + " " + anchor_text).lower()
-    # First require a course code or exact Arabic course label with number.
     strong = set()
     for code, meta in COURSES.items():
-        if code.lower() in combined:
-            strong.add(code)
-        elif any(t.lower() in combined for t in meta["terms"] if any(ch.isdigit() for ch in t)):
+        if code.lower() in combined or any(
+            t.lower() in combined for t in meta["terms"] if any(ch.isdigit() for ch in t)
+        ):
             strong.add(code)
     return strong
+
+def classify_resource(url, anchor="", title="", page_url=""):
+    """Classify by explicit course code first, then resource-specific subject terms."""
+    primary = " ".join([url or "", anchor or "", title or ""]).lower()
+    strong = local_course_from_path(primary, "")
+    if strong:
+        return strong
+    # Subject-name matching is limited to the resource URL/name and its visible anchor/title.
+    # Do not classify every link from a generic landing page by its full page text.
+    rules = {
+        "ENG301": ("english", "eng_301", "eng-301", "english_301"),
+        "DIN301": ("islamic", "islamic_studies", "islamic-studies", "islamic_301"),
+        "MATH364": ("mathematics", "maths", "math_364", "math-364", "math364"),
+        "ARB301": ("arabic", "arab_301", "arab-301", "arabic_301"),
+        "WATAN301": ("citizenship", "national_education", "national-education", "watan"),
+        "BIO316": ("biology", "biological_sciences", "biology_316", "bio_316"),
+        "PHY311": ("physics", "physics_311", "phy_311"),
+        "CHEM315": ("chemistry", "chemical_sciences", "chemistry_315", "chem_315"),
+    }
+    hits = set()
+    for code, terms in rules.items():
+        if any(term in primary for term in terms):
+            hits.add(code)
+    # The source page may identify a single course by its code; then its linked resources inherit it.
+    page_hits = local_course_from_path(page_url, "")
+    if not hits and len(page_hits) == 1:
+        hits = page_hits
+    return hits
 
 def is_edunet_url(url):
     try:
@@ -310,10 +340,7 @@ def parse_candidate_pages(root, session):
                     continue
                 anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
                 context = " ".join([anchor, tag.get("title") or "", tag.parent.get_text(" ", strip=True)[:300] if tag.parent else ""])
-                hits = local_course_from_path(target, context)
-                # The page URL itself can identify a course, but only if the URL contains its course code.
-                if not hits:
-                    hits = local_course_from_path(url, "")
+                hits = classify_resource(target, anchor, tag.get("title") or "", url)
                 path = urlparse(target).path.lower()
                 ext = Path(path).suffix.lower()
                 if ext in RESOURCE_EXTS:
@@ -419,6 +446,15 @@ def main():
     downloads = root / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
+    retry = Retry(
+        total=4, connect=4, read=3, backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=12, pool_maxsize=12)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     session.headers.update({"User-Agent": UA, "Accept-Language": "ar,en-US;q=0.8,en;q=0.6"})
     log("=" * 72)
     log("EduNET collector — resume existing project")
@@ -445,10 +481,12 @@ def main():
         "failures": [],
         "video_links": video_links,
         "notes": [
-            "Only resources with a strong course-specific URL or anchor/context match are downloaded.",
+            "Resource classification uses explicit course codes first and resource-specific subject terms second.",
             "Unclassified resources are logged as candidates and are not downloaded blindly.",
             "External video links are recorded, not downloaded automatically.",
+            "Transient HTTP errors are retried with backoff.",
         ],
+        "course_candidate_counts": {},
     }
     selected = []
     for url, meta in candidates.items():
@@ -459,10 +497,19 @@ def main():
                 selected.append((url, course))
     # Remove duplicate URL/course pairs while preserving order.
     selected = list(dict.fromkeys(selected))[:MAX_DOWNLOADS]
+    candidate_counts = defaultdict(int)
+    for _, code in selected:
+        candidate_counts[code] += 1
+    manifest["course_candidate_counts"] = dict(candidate_counts)
     log(f"Pages inspected: {len(visited)}")
     log(f"Resource URLs discovered: {len(candidates)}")
     log(f"Course-specific download jobs: {len(selected)}")
     log(f"Video links recorded: {len(video_links)}")
+    course_counts = defaultdict(int)
+    for _, course in selected:
+        course_counts[course] += 1
+    for code in COURSES:
+        log(f"  {code}: {course_counts.get(code, 0)} candidate job(s)")
     # AGA archive already present in the project is not downloaded again if same content is inventoried.
     for i, (url, course) in enumerate(selected, 1):
         log(f"[{i}/{len(selected)}] {course}: {url}")
@@ -483,6 +530,10 @@ def main():
     log(f"Existing/reused: {len(manifest['existing'])}")
     log(f"Duplicates skipped: {len(manifest['duplicates'])}")
     log(f"Failures: {len(manifest['failures'])}")
+    if manifest["failures"]:
+        log("Failure details:")
+        for item in manifest["failures"][:20]:
+            log("  - " + json.dumps(item, ensure_ascii=False))
     log(f"Report: {reports / 'edunet_latest_run.json'}")
     log("IMPORTANT: Review course coverage and failures before treating the collection as complete.")
 
