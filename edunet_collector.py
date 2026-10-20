@@ -313,14 +313,17 @@ def parse_candidate_pages(root, session):
     for u in sorted(seed_urls):
         if not is_edunet_url(u):
             continue
-        if looks_like_resource(u):
+        parsed = urlparse(u)
+        path = parsed.path.lower()
+        if looks_like_resource(u) or path.endswith(("/", ".zip", ".rar", ".pdf")):
             continue
-        if urlparse(u).path.lower().endswith((".zip", ".rar", ".pdf")):
+        if "/error/" in path or "aspxerrorpath=" in parsed.query.lower():
             continue
         page_queue.append((u, 0))
     visited = set()
     candidates = seed_resource_candidates  # URL -> {courses, anchor, source_page, kind}
     video_links = []
+    page_errors_seen = set()
     while page_queue and len(visited) < MAX_PAGES:
         url, depth = page_queue.popleft()
         url = normalize_url(url)
@@ -330,6 +333,12 @@ def parse_candidate_pages(root, session):
         try:
             resp = session.get(url, timeout=TIMEOUT)
             if resp.status_code != 200 or "text/html" not in (resp.headers.get("Content-Type") or "").lower():
+                continue
+            final_path = urlparse(resp.url).path.lower()
+            if "/error/" in final_path or "aspxerrorpath=" in urlparse(resp.url).query.lower():
+                continue
+            # Some EduNET directory routes redirect to a server error page; do not crawl them further.
+            if "somethingwronghit" in final_path:
                 continue
             soup = BeautifulSoup(resp.content, "html.parser")
             title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -366,12 +375,17 @@ def parse_candidate_pages(root, session):
                     if inherited_video_hits:
                         video_links.append({"url": target, "courses": sorted(inherited_video_hits), "title": anchor, "source_page": url})
                 elif is_edunet_url(target) and depth < 2 and target not in visited:
-                    # Follow only likely content pages, not arbitrary site navigation.
+                    # Avoid directory endpoints: several EduNET folders redirect to a 500 error page.
+                    target_path = urlparse(target).path.lower()
+                    if target_path.endswith("/") or "/error/" in target_path:
+                        continue
                     low = (target + " " + anchor).lower()
                     if any(k in low for k in ("e_content", "subject", "course", "lesson", "exam", "test", "book", "content", "stage_", "level_")):
                         page_queue.append((target, depth + 1))
         except Exception as e:
-            log(f"[PAGE-ERROR] {url}: {type(e).__name__}: {e}")
+            if url not in page_errors_seen:
+                page_errors_seen.add(url)
+                log(f"[PAGE-ERROR] {url}: {type(e).__name__}: {e}")
     return candidates, video_links, visited
 
 def download_one(session, url, course, dest_root, hash_index, manifest):
