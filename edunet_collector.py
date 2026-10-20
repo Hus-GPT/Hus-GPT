@@ -88,17 +88,8 @@ def course_hits(text):
     return hits
 
 def text_course_hits(text):
-    s = str(text or "").lower()
-    hits = set()
-    for code, meta in COURSES.items():
-        if code.lower() in s:
-            hits.add(code)
-            continue
-        for term in meta["terms"]:
-            if term.lower() in s:
-                hits.add(code)
-                break
-    return hits
+    """Require an explicit course code or numbered label; generic subjects are not course IDs."""
+    return course_hits(text)
 
 def load_urls_from_json(path):
     found = set()
