@@ -21,6 +21,8 @@ LOCAL_SCRIPT = Path("/content/edunet_collector_latest.py")
 urllib.request.urlretrieve(LATEST_SCRIPT, LOCAL_SCRIPT)
 
 print("Fetched latest collector:", LATEST_SCRIPT)
+source = LOCAL_SCRIPT.read_text(encoding="utf-8")
+compile(source, str(LOCAL_SCRIPT), "exec")  # fail early if the downloaded script is malformed
 runpy.run_path(str(LOCAL_SCRIPT), run_name="__main__")
 ```
 
