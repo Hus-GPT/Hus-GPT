@@ -399,6 +399,7 @@ def _ajax_links(html, source_url, course_context=None):
 
 def discover_ajax_resources(session):
     """Walk EduNET's observed AJAX sequence: levels -> subjects -> courses."""
+    flipbook_pages = set(FLIPBOOK_SEED_PAGES)
     candidates = {}
     videos = []
     inspected = [AJAX_HOME]
@@ -435,6 +436,10 @@ def discover_ajax_resources(session):
         for grade_id, part_id in sorted(level_pairs):
             try:
                 subjects_html = post_fragment(AJAX_ENDPOINTS["subjects"], {"gradeid": grade_id, "partid": part_id})
+                for target in _urls_in_markup(subjects_html, AJAX_ENDPOINTS["subjects"]):
+                    target_path = urlparse(target).path.lower()
+                    if is_edunet_url(target) and "/e_content/" in target_path and target_path.endswith(".html"):
+                        flipbook_pages.add(target)
                 inspected.append(f"{AJAX_ENDPOINTS['subjects']} [gradeid={grade_id},partid={part_id}]")
                 links, found_videos = _ajax_links(subjects_html, AJAX_ENDPOINTS["subjects"])
                 videos.extend(found_videos)
@@ -451,6 +456,10 @@ def discover_ajax_resources(session):
         for subject_id, (grade_id, part_id, subject_html) in sorted(subject_jobs.items()):
             try:
                 courses_html = post_fragment(AJAX_ENDPOINTS["courses"], {"subjectid": subject_id})
+                for target in _urls_in_markup(courses_html, AJAX_ENDPOINTS["courses"]):
+                    target_path = urlparse(target).path.lower()
+                    if is_edunet_url(target) and "/e_content/" in target_path and target_path.endswith(".html"):
+                        flipbook_pages.add(target)
                 source = f"{AJAX_ENDPOINTS['courses']} [subjectid={subject_id}]"
                 inspected.append(source)
                 # Use only explicit course-code context from the returned course fragment.
@@ -520,11 +529,11 @@ def _urls_in_markup(html, page_url):
             if urlparse(target).scheme in ("http", "https"):
                 found.add(target)
         onclick = tag.get("onclick") or ""
-        for raw in re.findall(r"""(?:https?://[^\\s'"<>]+|(?:\\.\\.?/|/)[^\\s'"<>]+)""", onclick):
+        for raw in re.findall(r"""(?:https?://[^\s'"<>]+|(?:\.\.?/|/)[^\s'"<>]+)""", onclick):
             target = urljoin(page_url, raw.rstrip(".,);]"))
             if urlparse(target).scheme in ("http", "https"):
                 found.add(target)
-    for raw in re.findall(r"""https?://[^\\s'"<>]+""", html or ""):
+    for raw in re.findall(r"""https?://[^\s'"<>]+""", html or ""):
         target = raw.rstrip(".,);]")
         if urlparse(target).scheme in ("http", "https"):
             found.add(target)
