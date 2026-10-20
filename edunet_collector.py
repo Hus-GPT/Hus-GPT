@@ -482,13 +482,6 @@ def discover_ajax_resources(session):
                 log(f"[AJAX-WARN] courses subjectid={subject_id}: {type(exc).__name__}: {exc}")
     except Exception as exc:
         log(f"[AJAX-WARN] AJAX discovery unavailable: {type(exc).__name__}: {exc}")
-    flipbook_pages = set(FLIPBOOK_SEED_PAGES)
-    # Preserve any flipbook entry pages exposed in dynamic AJAX fragments.
-    for inspected_url in inspected:
-        if isinstance(inspected_url, str) and "/e_content/" in inspected_url.lower() and inspected_url.lower().endswith(".html"):
-            flipbook_pages.add(inspected_url)
-    # AJAX fragments can contain relative index.html links; scan all recorded response text is
-    # intentionally avoided here because only verified URLs should become crawl targets.
     log(f"[AJAX] Resource URLs discovered directly from AJAX fragments: {len(candidates)}")
     return candidates, videos, inspected, flipbook_pages
 
