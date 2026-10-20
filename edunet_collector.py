@@ -544,7 +544,8 @@ def main():
     manifest["course_candidate_counts"] = dict(candidate_counts)
     log(f"Pages inspected: {len(visited)}")
     log(f"Resource URLs discovered: {len(candidates)}")
-    log(f"Course-specific download jobs: {len(selected)}")
+    log(f"Download jobs (course-specific + review-only): {len(selected)}")
+    log(f"Unclassified review-only jobs queued: {sum(1 for _, code in selected if code == '_REVIEW_UNCLASSIFIED')}")
     log(f"Video links recorded: {len(video_links)}")
     log(f"Unclassified resource candidates (audit only): {manifest['unclassified_candidate_count']}")
     for item in manifest["unclassified_candidates"][:10]:
@@ -554,6 +555,7 @@ def main():
         course_counts[course] += 1
     for code in COURSES:
         log(f"  {code}: {course_counts.get(code, 0)} candidate job(s)")
+    log(f"  Review-only (not assigned to a course): {course_counts.get('_REVIEW_UNCLASSIFIED', 0)} candidate job(s)")
     # AGA archive already present in the project is not downloaded again if same content is inventoried.
     for i, (url, course) in enumerate(selected, 1):
         log(f"[{i}/{len(selected)}] {course}: {url}")
