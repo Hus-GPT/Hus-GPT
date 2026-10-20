@@ -298,6 +298,181 @@ def valid_download(path, ext):
     except Exception:
         return False
 
+
+AJAX_HOME = "https://www.edunet.bh/Econtent/Eduecontent_P"
+AJAX_ENDPOINTS = {
+    "levels": "https://www.edunet.bh/Econtent/get_A_Levels_P",
+    "subjects": "https://www.edunet.bh/Econtent/get_Subjects_P2",
+    "courses": "https://www.edunet.bh/Econtent/get_Courses_P2",
+}
+
+def _ajax_html(response):
+    """Return HTML from an AJAX response, including JSON-wrapped HTML fragments."""
+    body = response.text or ""
+    if "html" in (response.headers.get("Content-Type") or "").lower() or "<" in body:
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                for value in data.values():
+                    if isinstance(value, str) and "<" in value:
+                        return value
+        except Exception:
+            pass
+        return body
+    try:
+        data = response.json()
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, str) and "<" in value:
+                    return value
+    except Exception:
+        pass
+    return body
+
+def _tag_attrs(tag):
+    pieces = [tag.get_text(" ", strip=True)]
+    for key, value in tag.attrs.items():
+        if isinstance(value, (list, tuple)):
+            value = " ".join(str(x) for x in value)
+        pieces.extend([str(key), str(value)])
+    return " ".join(pieces)
+
+def _ids_from_html(html, key):
+    """Extract IDs from data attributes, ordinary attributes, and inline handlers."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    pattern = re.compile(r"(?i)(?:data[-_]?|\\b)" + re.escape(key) + r"""\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)""")
+    found = set()
+    for tag in soup.find_all(True):
+        blob = _tag_attrs(tag)
+        found.update(int(m.group(1)) for m in pattern.finditer(blob))
+    # Some legacy pages pass IDs in JavaScript calls rather than data attributes.
+    found.update(int(m.group(1)) for m in pattern.finditer(html or ""))
+    return found
+
+def _level_pairs(html):
+    """Extract grade/part pairs from rendered level controls without guessing IDs."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    pairs = set()
+    for tag in soup.find_all(True):
+        blob = _tag_attrs(tag)
+        grade_matches = re.findall(r"(?i)(?:gradeid|grade_id|data-grade)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", blob)
+        part_matches = re.findall(r"(?i)(?:partid|part_id|data-part)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", blob)
+        if grade_matches and part_matches:
+            for grade in grade_matches:
+                for part in part_matches:
+                    pairs.add((int(grade), int(part)))
+    for match in re.finditer(r"(?is)(?:gradeid|grade_id)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+).*?(?:partid|part_id)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", html or ""):
+        pairs.add((int(match.group(1)), int(match.group(2))))
+    return pairs
+
+def _ajax_links(html, source_url, course_context=None):
+    """Collect direct resources and navigational links from an AJAX HTML fragment."""
+    resources = {}
+    videos = []
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup.find_all(["a", "iframe", "source", "embed"]):
+        href = tag.get("href") or tag.get("src")
+        if not href:
+            continue
+        target = urljoin(source_url, str(href).strip())
+        if urlparse(target).scheme not in ("http", "https"):
+            continue
+        anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
+        context = " ".join([anchor, tag.get("title") or "", tag.parent.get_text(" ", strip=True)[:400] if tag.parent else ""])
+        hits = classify_resource(target, anchor, tag.get("title") or "", source_url, context)
+        if not hits and course_context and len(course_context) == 1:
+            # Only inherit a context that is already a specific numbered course.
+            hits = set(course_context)
+        ext = Path(urlparse(target).path).suffix.lower()
+        if ext in RESOURCE_EXTS and is_edunet_url(target):
+            resources.setdefault(target, {"courses": set(), "anchor": anchor, "source_page": source_url, "extension": ext})
+            resources[target]["courses"].update(hits)
+        elif any(host in (urlparse(target).hostname or "").lower() for host in ("youtube.com", "youtu.be", "vimeo.com")):
+            if hits:
+                videos.append({"url": target, "courses": sorted(hits), "title": anchor, "source_page": source_url})
+    return resources, videos
+
+def discover_ajax_resources(session):
+    """Walk EduNET's observed AJAX sequence: levels -> subjects -> courses."""
+    candidates = {}
+    videos = []
+    inspected = [AJAX_HOME]
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer": AJAX_HOME,
+        "Origin": "https://www.edunet.bh",
+        "Accept": "text/html, */*; q=0.01",
+    }
+
+    def post_fragment(endpoint, payload=None):
+        response = session.post(endpoint, data=payload or {}, headers=headers, timeout=TIMEOUT)
+        response.raise_for_status()
+        return _ajax_html(response)
+
+    try:
+        # Load the landing page first to establish session cookies and any anti-forgery state.
+        landing = session.get(AJAX_HOME, headers={"User-Agent": UA, "Accept-Language": "ar,en-US;q=0.8,en;q=0.6"}, timeout=TIMEOUT)
+        inspected.append(landing.url)
+        if landing.status_code == 200:
+            headers["Referer"] = landing.url
+        levels_html = post_fragment(AJAX_ENDPOINTS["levels"])
+        inspected.append(AJAX_ENDPOINTS["levels"])
+        level_pairs = _level_pairs(levels_html)
+        # The reported working example is gradeid=10, partid=3. Use it only as a fallback
+        # when the levels fragment does not expose IDs in a machine-readable form.
+        if not level_pairs:
+            level_pairs = {(10, 3)}
+            log("[AJAX] Level IDs not parseable from response; trying reported fallback gradeid=10, partid=3.")
+        log(f"[AJAX] Level/part combinations discovered: {len(level_pairs)}")
+
+        subject_jobs = {}
+        for grade_id, part_id in sorted(level_pairs):
+            try:
+                subjects_html = post_fragment(AJAX_ENDPOINTS["subjects"], {"gradeid": grade_id, "partid": part_id})
+                inspected.append(f"{AJAX_ENDPOINTS['subjects']} [gradeid={grade_id},partid={part_id}]")
+                links, found_videos = _ajax_links(subjects_html, AJAX_ENDPOINTS["subjects"])
+                videos.extend(found_videos)
+                for url, meta in links.items():
+                    candidates.setdefault(url, meta)
+                subject_ids = _ids_from_html(subjects_html, "subjectid")
+                log(f"[AJAX] gradeid={grade_id}, partid={part_id}: subject IDs={len(subject_ids)}")
+                for subject_id in sorted(subject_ids):
+                    subject_jobs.setdefault(subject_id, (grade_id, part_id, subjects_html))
+            except Exception as exc:
+                log(f"[AJAX-WARN] subjects gradeid={grade_id},partid={part_id}: {type(exc).__name__}: {exc}")
+
+        log(f"[AJAX] Unique subject IDs queued: {len(subject_jobs)}")
+        for subject_id, (grade_id, part_id, subject_html) in sorted(subject_jobs.items()):
+            try:
+                courses_html = post_fragment(AJAX_ENDPOINTS["courses"], {"subjectid": subject_id})
+                source = f"{AJAX_ENDPOINTS['courses']} [subjectid={subject_id}]"
+                inspected.append(source)
+                # Use only explicit course-code context from the returned course fragment.
+                fragment_text = BeautifulSoup(courses_html, "html.parser").get_text(" ", strip=True)
+                context_hits = text_course_hits(fragment_text)
+                context = context_hits if len(context_hits) == 1 else None
+                links, found_videos = _ajax_links(courses_html, source, context)
+                videos.extend(found_videos)
+                for url, meta in links.items():
+                    candidates.setdefault(url, {"courses": set(), **meta})
+                    candidates[url]["courses"].update(meta["courses"])
+                # Some fragments expose resource URLs as plain attributes or JSON strings.
+                for raw_url in re.findall(r"""https?://[^\\s"'<>]+""", courses_html or ""):
+                    raw_url = raw_url.rstrip(".,);]")
+                    if looks_like_resource(raw_url) and is_edunet_url(raw_url):
+                        hits = local_course_from_path(raw_url, "") or (set(context) if context else set())
+                        candidates.setdefault(raw_url, {"courses": set(), "anchor": "URL found in AJAX response", "source_page": source, "extension": Path(urlparse(raw_url).path).suffix.lower()})
+                        candidates[raw_url]["courses"].update(hits)
+            except Exception as exc:
+                log(f"[AJAX-WARN] courses subjectid={subject_id}: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        log(f"[AJAX-WARN] AJAX discovery unavailable: {type(exc).__name__}: {exc}")
+    log(f"[AJAX] Resource URLs discovered directly from AJAX fragments: {len(candidates)}")
+    return candidates, videos, inspected
+
 def parse_candidate_pages(root, session):
     seed_urls = discover_existing(root)
     # Direct resource URLs in prior reports are candidates too; never require crawling them as HTML.
@@ -491,7 +666,16 @@ def main():
     log("Scanning existing reports; no previous report is overwritten.")
     old_hashes, existing_count = inventory_existing(root)
     log(f"Existing files inventoried: {existing_count}; unique content hashes: {len(old_hashes)}")
+    ajax_candidates, ajax_videos, ajax_inspected = discover_ajax_resources(session)
     candidates, video_links, visited = parse_candidate_pages(root, session)
+    # Prefer the site's observed AJAX navigation over assumptions based on static URL crawling.
+    for ajax_url, ajax_meta in ajax_candidates.items():
+        if ajax_url not in candidates:
+            candidates[ajax_url] = ajax_meta
+        else:
+            candidates[ajax_url]["courses"].update(ajax_meta.get("courses", set()))
+    video_links.extend(ajax_videos)
+    visited.update(ajax_inspected)
     # The previously validated AGA103 archive is a known candidate.
     candidates.setdefault(KNOWN_ARCHIVE, {"courses": {"AGA103"}, "anchor": "AGA103QA exam archive", "source_page": BASE, "extension": ".zip"})
     manifest = {
