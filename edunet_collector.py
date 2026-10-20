@@ -263,6 +263,16 @@ def valid_download(path, ext):
 
 def parse_candidate_pages(root, session):
     seed_urls = discover_existing(root)
+    # Direct resource URLs in prior reports are candidates too; never require crawling them as HTML.
+    seed_resource_candidates = {}
+    for seed in seed_urls:
+        if looks_like_resource(seed) and is_edunet_url(seed):
+            hits = local_course_from_path(seed, "")
+            if hits:
+                seed_resource_candidates[seed] = {
+                    "courses": set(hits), "anchor": "reused URL from existing report",
+                    "source_page": "existing report", "extension": Path(urlparse(seed).path).suffix.lower()
+                }
     # Only crawl EduNET pages from existing reports; binary resources are handled separately.
     page_queue = deque()
     for u in sorted(seed_urls):
@@ -274,7 +284,7 @@ def parse_candidate_pages(root, session):
             continue
         page_queue.append((u, 0))
     visited = set()
-    candidates = {}  # URL -> {courses, anchor, source_page, kind}
+    candidates = seed_resource_candidates  # URL -> {courses, anchor, source_page, kind}
     video_links = []
     while page_queue and len(visited) < MAX_PAGES:
         url, depth = page_queue.popleft()
