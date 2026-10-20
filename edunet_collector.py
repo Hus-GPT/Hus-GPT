@@ -148,16 +148,18 @@ def classify_resource(url, anchor="", title="", page_url="", context=""):
     strong = local_course_from_path(primary, "")
     if strong:
         return strong
+    # Do not treat a broad subject folder (e.g. /English/ or /Islamic/) as proof
+    # that a file belongs to one numbered course. Only explicit numbered labels qualify.
     rules = {
-        "ENG301": ("english", "eng_301", "eng-301", "english_301", "إنج 301", "انج 301"),
-        "DIN301": ("islamic", "islamic_studies", "islamic-studies", "islamic_301", "دين 301"),
-        "MATH364": ("mathematics", "maths", "math_364", "math-364", "math364", "ريض 364"),
-        "ARB301": ("arabic", "arab_301", "arab-301", "arabic_301", "عرب 301"),
-        "WATAN301": ("citizenship", "national_education", "national-education", "watan", "وطن 301"),
-        "BIO316": ("biology", "biological_sciences", "biology_316", "bio_316", "حيا 316"),
-        "PHY311": ("physics", "physics_311", "phy_311", "فيز 311"),
-        "CHEM315": ("chemistry", "chemical_sciences", "chemistry_315", "chem_315", "كيم 315"),
-        "AGA103": ("aga103", "أجا 103", "اجا 103"),
+        "ENG301": ("eng_301", "eng-301", "english_301", "english-301", "إنج 301", "انج 301"),
+        "DIN301": ("islamic_301", "islamic-301", "دين 301"),
+        "MATH364": ("math_364", "math-364", "maths_364", "ريض 364"),
+        "ARB301": ("arab_301", "arab-301", "arabic_301", "arabic-301", "عرب 301"),
+        "WATAN301": ("watan_301", "watan-301", "citizenship_301", "وطن 301"),
+        "BIO316": ("biology_316", "biology-316", "bio_316", "bio-316", "حيا 316"),
+        "PHY311": ("physics_311", "physics-311", "phy_311", "phy-311", "فيز 311"),
+        "CHEM315": ("chemistry_315", "chemistry-315", "chem_315", "chem-315", "كيم 315"),
+        "AGA103": ("أجا 103", "اجا 103"),
     }
     hits = set()
     for code, terms in rules.items():
@@ -517,6 +519,7 @@ def main():
         "course_candidate_counts": {},
     }
     selected = []
+    review_selected = []
     for url, meta in candidates.items():
         courses = sorted(meta["courses"])
         candidate_record = {"url": url, "courses": courses, "anchor": meta.get("anchor", ""), "source_page": meta.get("source_page", ""), "extension": meta.get("extension", "")}
@@ -526,9 +529,15 @@ def main():
                 selected.append((url, course))
         else:
             manifest["unclassified_candidates"].append(candidate_record)
+            # Preserve discoverable public resources without falsely assigning them to a course.
+            # They are downloaded into a clearly separate review folder for later content inspection.
+            if is_edunet_url(url) and looks_like_resource(url):
+                review_selected.append((url, "_REVIEW_UNCLASSIFIED"))
     manifest["unclassified_candidate_count"] = len(manifest["unclassified_candidates"])
-    # Remove duplicate URL/course pairs while preserving order.
-    selected = list(dict.fromkeys(selected))[:MAX_DOWNLOADS]
+    # Keep course-specific and review-only resources separate; de-duplicate URL/folder pairs.
+    selected = list(dict.fromkeys(selected))
+    review_selected = list(dict.fromkeys(review_selected))
+    selected = (selected + review_selected)[:MAX_DOWNLOADS]
     candidate_counts = defaultdict(int)
     for _, code in selected:
         candidate_counts[code] += 1
