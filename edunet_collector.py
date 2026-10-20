@@ -342,7 +342,7 @@ def _tag_attrs(tag):
 def _ids_from_html(html, key):
     """Extract IDs from data attributes, ordinary attributes, and inline handlers."""
     soup = BeautifulSoup(html or "", "html.parser")
-    pattern = re.compile(r"(?i)(?:data[-_]?|\\b)" + re.escape(key) + r"""\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)""")
+    pattern = re.compile(r"""(?i)(?:data[-_]?|\b)""" + re.escape(key) + r"""\s*['"]?\s*[:=]\s*['"]?(\d+)""")
     found = set()
     for tag in soup.find_all(True):
         blob = _tag_attrs(tag)
@@ -357,13 +357,13 @@ def _level_pairs(html):
     pairs = set()
     for tag in soup.find_all(True):
         blob = _tag_attrs(tag)
-        grade_matches = re.findall(r"(?i)(?:gradeid|grade_id|data-grade)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", blob)
-        part_matches = re.findall(r"(?i)(?:partid|part_id|data-part)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", blob)
+        grade_matches = re.findall(r"""(?i)(?:gradeid|grade_id|data-grade)\s*['"]?\s*[:=]\s*['"]?(\d+)""", blob)
+        part_matches = re.findall(r"""(?i)(?:partid|part_id|data-part)\s*['"]?\s*[:=]\s*['"]?(\d+)""", blob)
         if grade_matches and part_matches:
             for grade in grade_matches:
                 for part in part_matches:
                     pairs.add((int(grade), int(part)))
-    for match in re.finditer(r"(?is)(?:gradeid|grade_id)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+).*?(?:partid|part_id)\\s*['"]?\\s*[:=]\\s*['"]?(\\d+)", html or ""):
+    for match in re.finditer(r"""(?is)(?:gradeid|grade_id)\s*['"]?\s*[:=]\s*['"]?(\d+).*?(?:partid|part_id)\s*['"]?\s*[:=]\s*['"]?(\d+)""", html or ""):
         pairs.add((int(match.group(1)), int(match.group(2))))
     return pairs
 
@@ -460,7 +460,7 @@ def discover_ajax_resources(session):
                     candidates.setdefault(url, {"courses": set(), **meta})
                     candidates[url]["courses"].update(meta["courses"])
                 # Some fragments expose resource URLs as plain attributes or JSON strings.
-                for raw_url in re.findall(r"""https?://[^\\s"'<>]+""", courses_html or ""):
+                for raw_url in re.findall(r"""https?://[^\s'"<>]+""", courses_html or ""):
                     raw_url = raw_url.rstrip(".,);]")
                     if looks_like_resource(raw_url) and is_edunet_url(raw_url):
                         hits = local_course_from_path(raw_url, "") or (set(context) if context else set())
