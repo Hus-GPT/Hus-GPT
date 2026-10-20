@@ -105,9 +105,6 @@ def load_urls_from_json(path):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-    # Legacy markup may invoke the course endpoint with a bare numeric argument.
-    if key.lower() == "subjectid":
-        found.update(int(m.group(1)) for m in re.finditer(r"""(?i)get_Courses_P2\s*\(\s*(\d+)""", html or ""))
         return found
     def walk(obj):
         if isinstance(obj, dict):
@@ -476,8 +473,127 @@ def discover_ajax_resources(session):
                 log(f"[AJAX-WARN] courses subjectid={subject_id}: {type(exc).__name__}: {exc}")
     except Exception as exc:
         log(f"[AJAX-WARN] AJAX discovery unavailable: {type(exc).__name__}: {exc}")
+    flipbook_pages = set(FLIPBOOK_SEED_PAGES)
+    # Preserve any flipbook entry pages exposed in dynamic AJAX fragments.
+    for inspected_url in inspected:
+        if isinstance(inspected_url, str) and "/e_content/" in inspected_url.lower() and inspected_url.lower().endswith(".html"):
+            flipbook_pages.add(inspected_url)
+    # AJAX fragments can contain relative index.html links; scan all recorded response text is
+    # intentionally avoided here because only verified URLs should become crawl targets.
     log(f"[AJAX] Resource URLs discovered directly from AJAX fragments: {len(candidates)}")
-    return candidates, videos, inspected
+    return candidates, videos, inspected, flipbook_pages
+
+
+FLIPBOOK_SEED_PAGES = [
+    "https://www.edunet.bh/e_content/level_3/stage_10/subject_ID_28/Part_3/e_books/Math363SB/Math363SB/index.html",
+]
+FLIPBOOK_PATH_RE = re.compile(
+    r"(?i)/e_content/level_(\d+)/stage_(\d+)/subject_ID_(\d+)/Part_(\d+)/([^/]+)/"
+)
+
+def structural_path_info(url):
+    """Read verified EduNET hierarchy values from a resource URL."""
+    path = urlparse(url).path
+    match = FLIPBOOK_PATH_RE.search(path)
+    if not match:
+        return {}
+    level, gradeid, subjectid, partid, category = match.groups()
+    return {
+        "level": int(level), "gradeid": int(gradeid),
+        "subjectid": int(subjectid), "partid": int(partid),
+        "category": category,
+    }
+
+def _urls_in_markup(html, page_url):
+    """Extract URLs from ordinary links, download controls, and inline JS."""
+    found = set()
+    soup = BeautifulSoup(html or "", "html.parser")
+    for tag in soup.find_all(True):
+        for attr in ("href", "src", "data", "data-href", "data-url", "data-download", "formaction"):
+            value = tag.get(attr)
+            if not value:
+                continue
+            value = str(value).strip()
+            if value.lower().startswith(("javascript:", "mailto:", "tel:", "#")):
+                continue
+            target = urljoin(page_url, value)
+            if urlparse(target).scheme in ("http", "https"):
+                found.add(target)
+        onclick = tag.get("onclick") or ""
+        for raw in re.findall(r"""(?:https?://[^\\s'"<>]+|(?:\\.\\.?/|/)[^\\s'"<>]+)""", onclick):
+            target = urljoin(page_url, raw.rstrip(".,);]"))
+            if urlparse(target).scheme in ("http", "https"):
+                found.add(target)
+    for raw in re.findall(r"""https?://[^\\s'"<>]+""", html or ""):
+        target = raw.rstrip(".,);]")
+        if urlparse(target).scheme in ("http", "https"):
+            found.add(target)
+    return found
+
+def discover_flipbook_downloads(session, page_urls):
+    """Inspect flipbook HTML pages and resolve their explicit or conventional PDF download links."""
+    candidates = {}
+    inspected = []
+    queue = deque((u, 0) for u in sorted(set(page_urls)))
+    seen = set()
+    while queue and len(seen) < 80:
+        page_url, depth = queue.popleft()
+        if page_url in seen or not is_edunet_url(page_url):
+            continue
+        seen.add(page_url)
+        try:
+            response = session.get(page_url, timeout=TIMEOUT)
+            inspected.append(response.url)
+            if response.status_code != 200 or "text/html" not in (response.headers.get("Content-Type") or "").lower():
+                continue
+            html = response.text or ""
+            soup = BeautifulSoup(html, "html.parser")
+            title = soup.title.get_text(" ", strip=True) if soup.title else ""
+            page_text = soup.get_text(" ", strip=True)[:12000]
+            page_hits = classify_resource(page_url, title, title, page_url, page_text)
+            page_info = structural_path_info(response.url)
+            urls = _urls_in_markup(html, response.url)
+            base_dir = response.url.rsplit("/", 1)[0] + "/"
+            # If a visible Download control exists but its URL is assembled by JavaScript,
+            # probe the conventional sibling PDF; download_one will validate the response.
+            has_download_control = bool(re.search(r"(?i)download|تحميل|تنزيل", page_text) or
+                                        re.search(r"(?i)download|تحميل|تنزيل", html))
+            if has_download_control and response.url.lower().endswith("/index.html"):
+                book_folder = response.url.rsplit("/", 2)[-2]
+                urls.add(urljoin(base_dir, book_folder + ".pdf"))
+                urls.add(urljoin(base_dir, "files/mobile/" + book_folder + ".pdf"))
+            for target in sorted(urls):
+                if not is_edunet_url(target):
+                    continue
+                path = urlparse(target).path.lower()
+                ext = Path(path).suffix.lower()
+                if ext in RESOURCE_EXTS:
+                    anchor = ""
+                    for tag in soup.find_all(["a", "button", "iframe", "source", "embed"]):
+                        vals = [str(tag.get(k, "")) for k in ("href", "src", "data-href", "data-url", "onclick")]
+                        if any(v and (v in target or urljoin(response.url, v) == target) for v in vals):
+                            anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
+                            break
+                    hits = classify_resource(target, anchor, title, response.url, page_text)
+                    if not hits and len(page_hits) == 1:
+                        hits = set(page_hits)
+                    meta = {
+                        "courses": set(hits), "anchor": anchor or "resource linked from flipbook",
+                        "source_page": response.url, "extension": ext,
+                        "structural_path": structural_path_info(target),
+                    }
+                    if target not in candidates:
+                        candidates[target] = meta
+                    else:
+                        candidates[target]["courses"].update(hits)
+                elif depth == 0 and path.endswith(".html") and target != response.url:
+                    # Follow only nearby HTML pages within the same EduNET content tree.
+                    if "/e_content/" in path and target not in seen:
+                        queue.append((target, depth + 1))
+        except Exception as exc:
+            log(f"[FLIPBOOK-WARN] {page_url}: {type(exc).__name__}: {exc}")
+    log(f"[FLIPBOOK] HTML pages inspected: {len(seen)}; direct resource candidates: {len(candidates)}")
+    return candidates, inspected
 
 def parse_candidate_pages(root, session):
     seed_urls = discover_existing(root)
@@ -672,8 +788,15 @@ def main():
     log("Scanning existing reports; no previous report is overwritten.")
     old_hashes, existing_count = inventory_existing(root)
     log(f"Existing files inventoried: {existing_count}; unique content hashes: {len(old_hashes)}")
-    ajax_candidates, ajax_videos, ajax_inspected = discover_ajax_resources(session)
+    ajax_candidates, ajax_videos, ajax_inspected, flipbook_pages = discover_ajax_resources(session)
+    flipbook_candidates, flipbook_inspected = discover_flipbook_downloads(session, flipbook_pages)
     candidates, video_links, visited = parse_candidate_pages(root, session)
+    for flipbook_url, flipbook_meta in flipbook_candidates.items():
+        if flipbook_url not in candidates:
+            candidates[flipbook_url] = flipbook_meta
+        else:
+            candidates[flipbook_url]["courses"].update(flipbook_meta.get("courses", set()))
+    ajax_inspected.extend(flipbook_inspected)
     # Prefer the site's observed AJAX navigation over assumptions based on static URL crawling.
     for ajax_url, ajax_meta in ajax_candidates.items():
         if ajax_url not in candidates:
