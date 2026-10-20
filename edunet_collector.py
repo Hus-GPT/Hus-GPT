@@ -807,6 +807,11 @@ def main():
             candidates[ajax_url]["courses"].update(ajax_meta.get("courses", set()))
     video_links.extend(ajax_videos)
     visited.update(ajax_inspected)
+    # Attach parsed EduNET hierarchy to matching URLs for auditing and future discovery.
+    for candidate_url, candidate_meta in candidates.items():
+        path_info = structural_path_info(candidate_url)
+        if path_info:
+            candidate_meta["structural_path"] = path_info
     # The previously validated AGA103 archive is a known candidate.
     candidates.setdefault(KNOWN_ARCHIVE, {"courses": {"AGA103"}, "anchor": "AGA103QA exam archive", "source_page": BASE, "extension": ".zip"})
     manifest = {
@@ -837,7 +842,7 @@ def main():
     review_selected = []
     for url, meta in candidates.items():
         courses = sorted(meta["courses"])
-        candidate_record = {"url": url, "courses": courses, "anchor": meta.get("anchor", ""), "source_page": meta.get("source_page", ""), "extension": meta.get("extension", "")}
+        candidate_record = {"url": url, "courses": courses, "anchor": meta.get("anchor", ""), "source_page": meta.get("source_page", ""), "extension": meta.get("extension", ""), "structural_path": meta.get("structural_path", {})}
         manifest["candidates"].append(candidate_record)
         if courses:
             for course in courses:
