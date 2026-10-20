@@ -350,6 +350,8 @@ def parse_candidate_pages(root, session):
                 anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
                 context = " ".join([anchor, tag.get("title") or "", tag.parent.get_text(" ", strip=True)[:300] if tag.parent else ""])
                 hits = classify_resource(target, anchor, tag.get("title") or "", url, context)
+                if not hits and len(visible_page_hits) == 1:
+                    hits = visible_page_hits
                 path = urlparse(target).path.lower()
                 ext = Path(path).suffix.lower()
                 if ext in RESOURCE_EXTS:
@@ -360,8 +362,9 @@ def parse_candidate_pages(root, session):
                         # Save unclassified candidates for audit only; do not download blindly.
                         candidates.setdefault(target, {"courses": set(), "anchor": anchor, "source_page": url, "extension": ext})
                 elif any(host in (urlparse(target).hostname or "").lower() for host in ("youtube.com", "youtu.be", "vimeo.com")):
-                    if hits or local_course_from_path(url, ""):
-                        video_links.append({"url": target, "courses": sorted(hits or local_course_from_path(url, "")), "title": anchor, "source_page": url})
+                    inherited_video_hits = hits or (page_hits if len(page_hits) == 1 else set())
+                    if inherited_video_hits:
+                        video_links.append({"url": target, "courses": sorted(inherited_video_hits), "title": anchor, "source_page": url})
                 elif is_edunet_url(target) and depth < 2 and target not in visited:
                     # Follow only likely content pages, not arbitrary site navigation.
                     low = (target + " " + anchor).lower()
