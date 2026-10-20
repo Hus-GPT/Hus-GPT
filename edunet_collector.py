@@ -142,33 +142,38 @@ def local_course_from_path(url, anchor_text=""):
             strong.add(code)
     return strong
 
-def classify_resource(url, anchor="", title="", page_url=""):
-    """Classify by explicit course code first, then resource-specific subject terms."""
+def classify_resource(url, anchor="", title="", page_url="", context=""):
+    """Classify cautiously using resource identity, nearby link text, and unique page context."""
     primary = " ".join([url or "", anchor or "", title or ""]).lower()
     strong = local_course_from_path(primary, "")
     if strong:
         return strong
-    # Subject-name matching is limited to the resource URL/name and its visible anchor/title.
-    # Do not classify every link from a generic landing page by its full page text.
     rules = {
-        "ENG301": ("english", "eng_301", "eng-301", "english_301"),
-        "DIN301": ("islamic", "islamic_studies", "islamic-studies", "islamic_301"),
-        "MATH364": ("mathematics", "maths", "math_364", "math-364", "math364"),
-        "ARB301": ("arabic", "arab_301", "arab-301", "arabic_301"),
-        "WATAN301": ("citizenship", "national_education", "national-education", "watan"),
-        "BIO316": ("biology", "biological_sciences", "biology_316", "bio_316"),
-        "PHY311": ("physics", "physics_311", "phy_311"),
-        "CHEM315": ("chemistry", "chemical_sciences", "chemistry_315", "chem_315"),
+        "ENG301": ("english", "eng_301", "eng-301", "english_301", "إنج 301", "انج 301"),
+        "DIN301": ("islamic", "islamic_studies", "islamic-studies", "islamic_301", "دين 301"),
+        "MATH364": ("mathematics", "maths", "math_364", "math-364", "math364", "ريض 364"),
+        "ARB301": ("arabic", "arab_301", "arab-301", "arabic_301", "عرب 301"),
+        "WATAN301": ("citizenship", "national_education", "national-education", "watan", "وطن 301"),
+        "BIO316": ("biology", "biological_sciences", "biology_316", "bio_316", "حيا 316"),
+        "PHY311": ("physics", "physics_311", "phy_311", "فيز 311"),
+        "CHEM315": ("chemistry", "chemical_sciences", "chemistry_315", "chem_315", "كيم 315"),
+        "AGA103": ("aga103", "أجا 103", "اجا 103"),
     }
     hits = set()
     for code, terms in rules.items():
         if any(term in primary for term in terms):
             hits.add(code)
-    # The source page may identify a single course by its code; then its linked resources inherit it.
+    if hits:
+        return hits
+    # Nearby row/card text often carries the subject label while the file URL is opaque.
+    context_hits = text_course_hits(context)
+    if len(context_hits) == 1:
+        return context_hits
+    # Inherit a course only when the source page URL/title itself identifies exactly one course.
     page_hits = local_course_from_path(page_url, "")
-    if not hits and len(page_hits) == 1:
-        hits = page_hits
-    return hits
+    if len(page_hits) == 1:
+        return page_hits
+    return set()
 
 def is_edunet_url(url):
     try:
@@ -330,6 +335,10 @@ def parse_candidate_pages(root, session):
             title = soup.title.get_text(" ", strip=True) if soup.title else ""
             page_text = soup.get_text(" ", strip=True)[:25000]
             page_hits = local_course_from_path(url, title)
+            # If the page visibly names exactly one target course, its links can inherit that context.
+            visible_page_hits = text_course_hits(page_text)
+            if len(visible_page_hits) == 1:
+                page_hits = visible_page_hits
             # Don't assign every course mentioned on a general landing page.
             for tag in soup.find_all(["a", "iframe", "source"]):
                 href = tag.get("href") or tag.get("src")
@@ -340,7 +349,7 @@ def parse_candidate_pages(root, session):
                     continue
                 anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
                 context = " ".join([anchor, tag.get("title") or "", tag.parent.get_text(" ", strip=True)[:300] if tag.parent else ""])
-                hits = classify_resource(target, anchor, tag.get("title") or "", url)
+                hits = classify_resource(target, anchor, tag.get("title") or "", url, context)
                 path = urlparse(target).path.lower()
                 ext = Path(path).suffix.lower()
                 if ext in RESOURCE_EXTS:
@@ -481,20 +490,26 @@ def main():
         "failures": [],
         "video_links": video_links,
         "notes": [
-            "Resource classification uses explicit course codes first and resource-specific subject terms second.",
-            "Unclassified resources are logged as candidates and are not downloaded blindly.",
+            "Resource classification uses explicit course codes, nearby link/card text, and unique course context on source pages.",
+            "Unclassified resources remain in the audit report and are not downloaded blindly.",
             "External video links are recorded, not downloaded automatically.",
             "Transient HTTP errors are retried with backoff.",
         ],
+        "unclassified_candidate_count": 0,
+        "unclassified_candidates": [],
         "course_candidate_counts": {},
     }
     selected = []
     for url, meta in candidates.items():
         courses = sorted(meta["courses"])
-        manifest["candidates"].append({"url": url, "courses": courses, "anchor": meta.get("anchor", ""), "source_page": meta.get("source_page", ""), "extension": meta.get("extension", "")})
+        candidate_record = {"url": url, "courses": courses, "anchor": meta.get("anchor", ""), "source_page": meta.get("source_page", ""), "extension": meta.get("extension", "")}
+        manifest["candidates"].append(candidate_record)
         if courses:
             for course in courses:
                 selected.append((url, course))
+        else:
+            manifest["unclassified_candidates"].append(candidate_record)
+    manifest["unclassified_candidate_count"] = len(manifest["unclassified_candidates"])
     # Remove duplicate URL/course pairs while preserving order.
     selected = list(dict.fromkeys(selected))[:MAX_DOWNLOADS]
     candidate_counts = defaultdict(int)
@@ -505,6 +520,9 @@ def main():
     log(f"Resource URLs discovered: {len(candidates)}")
     log(f"Course-specific download jobs: {len(selected)}")
     log(f"Video links recorded: {len(video_links)}")
+    log(f"Unclassified resource candidates (audit only): {manifest['unclassified_candidate_count']}")
+    for item in manifest["unclassified_candidates"][:10]:
+        log("  [UNCLASSIFIED] " + item["url"])
     course_counts = defaultdict(int)
     for _, course in selected:
         course_counts[course] += 1
