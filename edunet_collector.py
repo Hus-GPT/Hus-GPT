@@ -480,6 +480,10 @@ def discover_ajax_resources(session):
 FLIPBOOK_SEED_PAGES = [
     "https://www.edunet.bh/e_content/level_3/stage_10/subject_ID_28/Part_3/e_books/Math363SB/Math363SB/index.html",
 ]
+# Direct PDF confirmed by the user; course assignment remains conservative.
+DIRECT_PDF_SEED_URLS = [
+    "https://www.edunet.bh/e_content/level_3/stage_10/subject_ID_27/Part_3/e_books/BIO-317-TG(1)/BIO-317-TG(1).pdf",
+]
 FLIPBOOK_PATH_RE = re.compile(
     r"(?i)/e_content/level_(\d+)/stage_(\d+)/subject_ID_(\d+)/Part_(\d+)/([^/]+)/"
 )
@@ -523,13 +527,42 @@ def _urls_in_markup(html, page_url):
             found.add(target)
     return found
 
+def _direct_pdf_variants(page_url):
+    """Generate conventional direct-PDF paths from a discovered EduNET flipbook page."""
+    path = unquote(urlparse(page_url).path)
+    if not path.lower().endswith("/index.html"):
+        return set()
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 3:
+        return set()
+    inner_folder = parts[-2]
+    outer_folder = parts[-3]
+    # Probe both observed layouts and the common mobile PDF location.
+    base_dir = page_url.rsplit("/", 2)[0] + "/"
+    variants = {
+        urljoin(page_url, inner_folder + ".pdf"),
+        urljoin(base_dir, inner_folder + ".pdf"),
+        urljoin(base_dir, "files/mobile/" + inner_folder + ".pdf"),
+    }
+    if outer_folder != inner_folder:
+        variants.add(urljoin(base_dir, outer_folder + ".pdf"))
+    return {u for u in variants if is_edunet_url(u) and urlparse(u).path.lower().endswith(".pdf")}
+
 def discover_flipbook_downloads(session, page_urls):
-    """Inspect flipbook HTML pages and resolve their explicit or conventional PDF download links."""
+    """Discover direct resources and probe conventional PDFs for every flipbook."""
     candidates = {}
     inspected = []
+    for direct_url in DIRECT_PDF_SEED_URLS:
+        hits = local_course_from_path(direct_url, "")
+        candidates[direct_url] = {
+            "courses": set(hits), "anchor": "direct PDF path confirmed by field test",
+            "source_page": "verified direct PDF seed", "extension": ".pdf",
+            "structural_path": structural_path_info(direct_url),
+        }
+
     queue = deque((u, 0) for u in sorted(set(page_urls)))
     seen = set()
-    while queue and len(seen) < 80:
+    while queue and len(seen) < 120:
         page_url, depth = queue.popleft()
         if page_url in seen or not is_edunet_url(page_url):
             continue
@@ -544,17 +577,13 @@ def discover_flipbook_downloads(session, page_urls):
             title = soup.title.get_text(" ", strip=True) if soup.title else ""
             page_text = soup.get_text(" ", strip=True)[:12000]
             page_hits = classify_resource(page_url, title, title, page_url, page_text)
-            page_info = structural_path_info(response.url)
             urls = _urls_in_markup(html, response.url)
-            base_dir = response.url.rsplit("/", 1)[0] + "/"
-            # If a visible Download control exists but its URL is assembled by JavaScript,
-            # probe the conventional sibling PDF; download_one will validate the response.
-            has_download_control = bool(re.search(r"(?i)download|تحميل|تنزيل", page_text) or
-                                        re.search(r"(?i)download|تحميل|تنزيل", html))
-            if has_download_control and response.url.lower().endswith("/index.html"):
-                book_folder = response.url.rsplit("/", 2)[-2]
-                urls.add(urljoin(base_dir, book_folder + ".pdf"))
-                urls.add(urljoin(base_dir, "files/mobile/" + book_folder + ".pdf"))
+
+            # FlipHTML5 pages may assemble their download URL in JavaScript or expose no
+            # ordinary href. Probe both known direct-PDF layouts without requiring a button.
+            if response.url.lower().endswith("/index.html"):
+                urls.update(_direct_pdf_variants(response.url))
+
             for target in sorted(urls):
                 if not is_edunet_url(target):
                     continue
@@ -563,7 +592,7 @@ def discover_flipbook_downloads(session, page_urls):
                 if ext in RESOURCE_EXTS:
                     anchor = ""
                     for tag in soup.find_all(["a", "button", "iframe", "source", "embed"]):
-                        vals = [str(tag.get(k, "")) for k in ("href", "src", "data-href", "data-url", "onclick")]
+                        vals = [str(tag.get(k, "")) for k in ("href", "src", "data-href", "data-url", "data-download", "onclick")]
                         if any(v and (v in target or urljoin(response.url, v) == target) for v in vals):
                             anchor = tag.get_text(" ", strip=True) or tag.get("title") or tag.get("aria-label") or ""
                             break
@@ -571,7 +600,7 @@ def discover_flipbook_downloads(session, page_urls):
                     if not hits and len(page_hits) == 1:
                         hits = set(page_hits)
                     meta = {
-                        "courses": set(hits), "anchor": anchor or "resource linked from flipbook",
+                        "courses": set(hits), "anchor": anchor or "direct resource / conventional PDF path",
                         "source_page": response.url, "extension": ext,
                         "structural_path": structural_path_info(target),
                     }
@@ -580,7 +609,6 @@ def discover_flipbook_downloads(session, page_urls):
                     else:
                         candidates[target]["courses"].update(hits)
                 elif depth == 0 and path.endswith(".html") and target != response.url:
-                    # Follow only nearby HTML pages within the same EduNET content tree.
                     if "/e_content/" in path and target not in seen:
                         queue.append((target, depth + 1))
         except Exception as exc:
